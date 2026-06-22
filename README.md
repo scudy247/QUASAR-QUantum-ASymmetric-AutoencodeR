@@ -5,22 +5,49 @@ Extreme compression of IoT telemetry for constrained links (UAN / LoRa): a tiny
 decoder** reconstructs the full signal. Trained end-to-end; only the encoder is deployed.
 
 ```
-x in R^D --[Phase1: classical edge encoder, TinyML]--> z in R^N  (N << D)
-z --[Phase2: VQC on N qubits]--> <Z_i> (N values) --[classical Linear N->D]--> x_hat in R^D
+DEVICE (dummy):  x in R^D --[Phase1: classical edge encoder, TinyML]--> z in [-1,1]^N  (N << D)
+                 --> transmit z   (no quantum-specific scaling on the device)
+CLOUD:           z --[qml.AngleEmbedding(z): embeds encoder output directly]--> [VQC on N qubits]
+                 --> <Z_i> (N values) --[classical Linear N->D]--> x_hat in R^D
 ```
 
 The classical expansion `Linear(N -> D)` means **only N (= bottleneck) qubits are
 simulated**, so large D (here 256) is fully simulatable.
 
+## Workflow
+
+```mermaid
+flowchart LR
+    X["raw telemetry x in R^256<br/>(2 HAR channels x 128)"] --> ENC["CNN EdgeEncoder<br/>Phase 1 (TinyML, on device)"]
+    ENC --> Z["latent z in [-1,1]^N<br/>N = 2..10"]
+    Z --> Q["quantize to b bits<br/>(optional)"]
+    Q -->|"transmit N*b bits<br/>UAN / LoRa link"| AE
+    subgraph CLOUD["Cloud decoder - Phase 2"]
+      AE["AngleEmbedding(z)"] --> VQC["VQC<br/>BasicEntanglerLayers"]
+      VQC --> MZ["measure Pauli-Z<br/>(N values)"]
+      MZ --> EXP["classical Linear<br/>N -> 256"]
+    end
+    EXP --> XR["reconstruction<br/>x_hat in R^256"]
+```
+
+End-to-end training (MSE) couples encoder + decoder (Phase 3); deployment exports **only the
+encoder** to ONNX (Phase 4). Two classical decoders (`matched`, `pure`) are trained the same
+way as fair baselines, and the latent can be quantized to `b` bits to study rate-distortion.
+
 ## Files
 
 | File | Role |
 |------|------|
-| `run_experiment.py` | The whole experiment (Phases 1-4) + matched/pure classical baselines + plot. |
+| `run_experiment.py` | Main multi-seed sweep: CNN encoder + quantum/matched/pure decoders across N. Defines the models reused by the other scripts. |
+| `train_and_deploy.py` | Train one model, then **split** it for deployment: saves `trained_encoder/decoder_N*.pt` + `edge_encoder_N*.onnx`. |
+| `compare_decoders.py` | Focused, multi-seed quantum-vs-classical decoder comparison at one N. |
+| `quantize_eval.py` | Latent **quantization & rate-distortion** study (MSE + SNR vs bits). |
+| `plot_results.py` | Clear results figure (parses `run_sweep.log`). |
+| `plot_sweep.py` | Post-sweep convergence/reconstruction plots for the CNN encoder. |
 | `data.py` | Loads real UCI HAR (`load_dataset("har")`); synthetic fallback. |
 | `datasets/` | UCI HAR inertial signals + `.npz` cache. |
-| `edge_encoder_N{2,4,8}.onnx` | Exported edge encoders (Phase 4 artifact, ~7 KB each). |
-| `results_hybrid.png` | Reconstruction MSE vs. compression: hybrid vs. classical. |
+| `edge_encoder_N*.onnx`, `trained_*_N*.pt` | Deployment artifacts: edge encoder (ONNX) + saved model halves. |
+| `results_*.png` | Figures (main sweep, quantization, reconstructions). |
 
 Environment: a Python venv with `torch`, `pennylane`, `pennylane-lightning`,
 `onnx`, `onnxscript`, `scikit-learn`.
@@ -42,17 +69,38 @@ cd ..
 
 First run caches the dataset to `datasets/har_cache.npz`.
 
-## Run
+## Run everything
+
+All commands from inside `qic/`, using the venv interpreter. Long runs should go in the
+`simulations` tmux session, e.g. `tmux send-keys -t simulations '<cmd> > out.log 2>&1' Enter`.
 
 ```bash
 cd /home/fabio/Quantum/OurFramework/qic
-../.venv/bin/python run_experiment.py    # ~50 s (5 seeds); prints the table, exports ONNX, saves the plot
+
+# 1. Main sweep: hybrid vs classical decoders across compression ratios (multi-seed)
+../.venv/bin/python run_experiment.py        # -> run_sweep.log, edge_encoder_N*.onnx
+../.venv/bin/python plot_results.py          # -> results_hybrid.png (clear figure)
+
+# 2. Latent quantization & rate-distortion (transmitted bits vs reconstruction error)
+../.venv/bin/python quantize_eval.py         # -> results_quantization.png, results_quantization_N8.png
+
+# 3. Focused quantum-vs-classical comparison at one bottleneck
+../.venv/bin/python compare_decoders.py --N 8 --seeds 0 1 2
+
+# 4. Train then split for deployment (saves encoder/decoder .pt + encoder ONNX)
+../.venv/bin/python train_and_deploy.py --N 6 --epochs 80
+
+# 5. Post-sweep plots for the CNN encoder
+../.venv/bin/python plot_sweep.py
 ```
 
-Knobs at the top of `run_experiment.py`: `D` (telemetry dim = 256), `N_VALUES` (bottleneck =
-qubit count; keep small so it stays simulatable), `HIDDEN`, `Q_LAYERS`, `EPOCHS`, `SEEDS`.
+Tunable knobs live at the top of each script (`D`, `N_VALUES`, `BITS`, `SEEDS`, `EPOCHS`, ...).
 
 ## Result (real HAR, D=256, 5 seeds: mean ± std)
+
+> Note: this table is from the earlier **MLP** encoder. The current code uses a **1D-CNN**
+> encoder (and a quantization study); results are being regenerated — see `run_sweep.log`
+> and `results_quantization.png`.
 
 | N | compression | MSE hybrid | MSE matched-classical | MSE pure-classical | encoder |
 |--:|--:|--:|--:|--:|--:|

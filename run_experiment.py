@@ -9,8 +9,10 @@ actually helps by comparing it against two classical decoders of matched/lower c
 
 ARCHITECTURE (four phases; see the PHASE comments next to each function)
 -----------------------------------------------------------------------
-  Phase 1  EdgeEncoder (classical, runs on the device):  x in R^D -> z in R^N   (N << D)
-  Phase 2  CloudDecoder (cloud): N-qubit VQC -> N expectation values
+  Phase 1  EdgeEncoder (classical, runs on the *dummy* device):  x in R^D -> z in [-1,1]^N
+                                  -> ships z (no quantum-specific scaling on the device)
+  Phase 2  CloudDecoder (cloud): qml.AngleEmbedding(z) FIRST (embeds encoder output directly)
+                                  -> N-qubit VQC -> N expectation values
                                   -> classical Linear(N -> D) expansion -> x_hat in R^D
   Phase 3  end-to-end training: one optimizer trains encoder + decoder jointly (MSE)
   Phase 4  severance: export ONLY the encoder to ONNX (the artifact the device ships)
@@ -82,29 +84,44 @@ def load_d256():
 
 
 # ---- models -----------------------------------------------------------------
-# PHASE 1: classical edge encoder (the deployed TinyML artifact). Maps raw telemetry
-# x in R^D -> compressed latent z in [-1,1]^N, then scales to angles in [-pi, pi] so the
-# values are valid rotation angles for the quantum decoder.
+CHANNELS = 2                      # raw input is 2 HAR channels (body_acc_x, body_acc_y); D = CHANNELS * 128
+
+# PHASE 1: classical edge encoder (the deployed TinyML artifact). A *dummy* device: it only
+# produces data, compresses it, and ships the result. It uses a 1D-CONVOLUTIONAL front-end --
+# the idiomatic design for raw inertial signals: the flat input is reshaped back to its true
+# (2 channels x 128 samples) layout and small filters slide along the TIME axis with weights
+# shared across time, capturing local temporal structure (the transient spikes a flat dense
+# layer smears). Output: compressed latent z in [-1,1]^N (Tanh-bounded), transmitted as-is.
+# The device does NOT know the cloud is quantum -- angle embedding is the cloud's job (Phase 2).
 class EdgeEncoder(nn.Module):
     def __init__(self, N):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(D, HIDDEN), nn.ReLU(),
-                                 nn.Linear(HIDDEN, N), nn.Tanh())
+        L = D // CHANNELS                                  # samples per channel (128)
+        self.features = nn.Sequential(
+            nn.Conv1d(CHANNELS, 8, kernel_size=7, stride=2, padding=3), nn.ReLU(),  # (2,128) -> (8, 64)
+            nn.Conv1d(8, 16, kernel_size=5, stride=2, padding=2), nn.ReLU(),        # (8, 64) -> (16, 32)
+        )
+        # flatten keeps WHERE features occur in time (vs. global pooling, which discards it) --
+        # important because the cloud must reconstruct the full waveform, not just classify it.
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(16 * (L // 4), N), nn.Tanh())
 
     def forward(self, x):
-        return self.net(x) * torch.pi          # latent angles in [-pi, pi]
+        x = x.view(x.size(0), CHANNELS, -1)    # (B, 256) -> (B, 2, 128): restore channel/time layout
+        return self.head(self.features(x))     # latent z in [-1, 1]; no quantum-specific scaling
 
 
-# PHASE 2: quantum cloud decoder. AngleEmbedding loads the N latent values as qubit
-# rotations; BasicEntanglerLayers mixes them; we read N Pauli-Z expectation values; then a
-# classical Linear(N -> D) expands back to the full telemetry dimension. Only N qubits are
-# simulated, so this scales to large D.
+# PHASE 2: quantum cloud decoder. The cloud receives the raw latent z (the N-dim output of
+# the classical encoder) from the (dummy) device and does the angle embedding ITSELF as its
+# FIRST step: qml.AngleEmbedding consumes the encoder output directly as qubit rotation angles
+# (no scaling -- the encoder learns suitable values; len(features)=N <= N qubits is required
+# and is guaranteed here since both equal N). BasicEntanglerLayers then mixes them; we read N
+# Pauli-Z expectation values; finally a classical Linear(N -> D) expands back to full telemetry.
 def quantum_decoder(N):
     dev = qml.device("lightning.qubit", wires=N)        # fast C++ simulator
 
     @qml.qnode(dev, interface="torch", diff_method="adjoint")   # memory-efficient grads
     def circ(inputs, weights):
-        qml.AngleEmbedding(inputs, wires=range(N))         # state preparation from latent
+        qml.AngleEmbedding(inputs, wires=range(N))         # FIRST cloud step: embed encoder output directly
         qml.BasicEntanglerLayers(weights, wires=range(N))  # parameterized entangling layers
         return [qml.expval(qml.PauliZ(i)) for i in range(N)]
 
