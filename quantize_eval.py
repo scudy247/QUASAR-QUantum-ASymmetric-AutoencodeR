@@ -1,132 +1,186 @@
-"""Latent quantization & rate-distortion study for the hybrid quantum-classical autoencoder.
+"""Evaluation experiments for the hybrid quantum-classical autoencoder.
 
-The transmitted payload is not N floats but N x b BITS. This script trains each model once
-(reusing the CNN encoder + decoders from run_experiment.py), then does POST-TRAINING
-quantization of the latent z to b bits per value and measures how lossy reconstruction is:
+This single eval script now covers three modes (it incorporates the former noise_eval.py
+and param_efficiency.py). Models/training/data are imported from run_experiment.py.
 
-    encode  ->  z in [-1,1]^N  ->  quantize to b bits  ->  decode  ->  x_hat
+  python quantize_eval.py quant      # latent quantization / rate-distortion  -> results_quantization.png
+  python quantize_eval.py noise      # channel-noise robustness               -> results_noise.png
+  python quantize_eval.py parameff   # parameter-efficiency Pareto at N=8      -> results_param_efficiency.png
 
-Outputs:
-  * a table of MSE and SNR(dB) per (model, N, bits) with payload = N*b bits;
-  * a rate-distortion plot (MSE vs payload bits) comparing the quantum decoder against the
-    fair classical baseline -- i.e. does the quantum advantage SURVIVE quantization;
-  * an N=8 detail plot (MSE vs bits).
-
-Run (in the tmux 'simulations' session):
-  ../.venv/bin/python quantize_eval.py
+Flags:  --encoder cnn|gru   --quick   --epochs E   --seeds S [S ...]
 """
 
+import argparse
+import os
 import warnings
 from collections import defaultdict
-
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_v, "8")        # cap threads BEFORE numpy/torch import
 import numpy as np
 import torch
+torch.set_num_threads(8)
 
-from run_experiment import (EdgeEncoder, quantum_decoder, matched_classical_decoder,
-                            load_d256, train, N_TRAIN)
+import run_experiment as R
 
 warnings.filterwarnings("ignore")
 
-N_VALUES = [4, 6, 8, 10]          # bottleneck sizes (= qubit counts)
-BITS = [8, 4, 3, 2, 1]            # bits per latent value (8 ~ lossless reference)
-SEEDS = [0, 1, 2]                 # repeats -> error bars
-EPOCHS = 50
-DECODERS = {"hybrid": quantum_decoder, "matched": matched_classical_decoder}
+
+def _ms(d, k):
+    a = np.array(d[k])
+    return a.mean(), a.std()
 
 
-def quantize(z, bits):
-    """Uniform mid-rise quantizer of z in [-1,1] to `bits` bits (2**bits levels)."""
-    levels = 2 ** bits
-    zc = torch.clamp(z, -1.0, 1.0)
-    return torch.round((zc + 1) / 2 * (levels - 1)) / (levels - 1) * 2 - 1
+# -------------------- quant: latent quantization / rate-distortion --------------------
+def quant(a):
+    N_VALUES = [4, 8] if a.quick else [4, 6, 8, 10]
+    BITS = [4, 1] if a.quick else [8, 4, 3, 2, 1]
+    SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
+    EPOCHS = a.epochs or (5 if a.quick else 50)
+    decoders = {"hybrid": R.quantum_decoder, "matched": R.matched_classical_decoder}
+    Xtr_pool, Xte = R.load_d256()
+    print(f"[quant] encoder={R.ENCODER_KIND} N={N_VALUES} bits={BITS} seeds={SEEDS}\n")
 
+    def quantize(z, bits):
+        lv = 2 ** bits
+        return torch.round((torch.clamp(z, -1, 1) + 1) / 2 * (lv - 1)) / (lv - 1) * 2 - 1
 
-def lossiness(xhat, x):
-    """Return (MSE, SNR in dB). Higher SNR = less lossy."""
-    mse = float(torch.mean((xhat - x) ** 2))
-    snr = 10.0 * np.log10(float(torch.mean(x ** 2)) / mse) if mse > 0 else float("inf")
-    return mse, snr
-
-
-def main():
-    Xtr_pool, Xte = load_d256()
-    print(f"D={Xte.shape[1]}  test {tuple(Xte.shape)}  seeds {SEEDS}  bits {BITS}\n")
-
-    # res[(model, N, bits)] -> list of (mse, snr) over seeds
     res = defaultdict(list)
-    for seed in SEEDS:
-        rng = np.random.default_rng(seed)
-        Xtr = Xtr_pool[rng.integers(0, len(Xtr_pool), N_TRAIN)]    # bootstrap train
+    for s in SEEDS:
+        rng = np.random.default_rng(s)
+        Xtr = Xtr_pool[rng.integers(0, len(Xtr_pool), R.N_TRAIN)]
         for N in N_VALUES:
-            for mname, dec_fn in DECODERS.items():
-                torch.manual_seed(seed)                            # identical encoder init
-                enc, dec = EdgeEncoder(N), dec_fn(N)
-                train(enc, dec, Xtr, Xte, EPOCHS)                  # trains in place
+            for dn, df in decoders.items():
+                torch.manual_seed(s)
+                enc, dec = R.EdgeEncoder(N), df(N)
+                R.train(enc, dec, Xtr, Xte, EPOCHS)
                 enc.eval(); dec.eval()
                 with torch.no_grad():
                     z = enc(Xte)
                     for b in BITS:
-                        res[(mname, N, b)].append(lossiness(dec(quantize(z, b)), Xte))
-                print(f"[seed {seed}] N={N:>2} {mname:<8} done", flush=True)
+                        res[(dn, N, b)].append(float(((dec(quantize(z, b)) - Xte) ** 2).mean()))
+                print(f"  [seed {s} N={N} {dn}] done", flush=True)
 
-    def agg(key):
-        a = np.array(res[key])
-        return a[:, 0].mean(), a[:, 0].std(), a[:, 1].mean()   # mse_mean, mse_std, snr_mean
-
-    # ---- table ----
-    print(f"\n{'model':<8}{'N':>3}{'bits':>5}{'payload':>9}{'MSE (mean+/-std)':>22}{'SNR dB':>9}")
-    print("-" * 56)
-    for mname in DECODERS:
+    print(f"\n{'dec':<8}{'N':>3}{'bits':>5}{'payload':>9}{'MSE':>10}")
+    for dn in decoders:
         for N in N_VALUES:
             for b in BITS:
-                mm, ms, snr = agg((mname, N, b))
-                print(f"{mname:<8}{N:>3}{b:>5}{N*b:>7} b{f'{mm:.4f}+/-{ms:.4f}':>22}{snr:>9.1f}")
-        print()
+                print(f"{dn:<8}{N:>3}{b:>5}{N * b:>7} b{_ms(res, (dn, N, b))[0]:>10.4f}")
+    Nshow = 8 if 8 in N_VALUES else N_VALUES[-1]
+    _plot({dn: [(b, *_ms(res, (dn, Nshow, b))) for b in BITS] for dn in decoders},
+          "bits per latent value (more compression →)", f"Quantization at N={Nshow}",
+          "results_quantization.png", invert=True)
 
-    # ---- plots ----
+
+# -------------------- noise: channel-noise robustness --------------------
+def noise(a):
+    N_VALUES = [4, 8] if a.quick else [4, 6, 8, 10]
+    SIGMAS = [0.0, 0.2] if a.quick else [0.0, 0.05, 0.1, 0.2, 0.4]
+    SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
+    EPOCHS = a.epochs or (5 if a.quick else 50)
+    decoders = {"hybrid": R.quantum_decoder, "matched": R.matched_classical_decoder}
+    Xtr_pool, Xte = R.load_d256()
+    print(f"[noise] encoder={R.ENCODER_KIND} N={N_VALUES} sigmas={SIGMAS} seeds={SEEDS}\n")
+
+    res = defaultdict(list)
+    for s in SEEDS:
+        rng = np.random.default_rng(s)
+        g = torch.Generator().manual_seed(s)
+        Xtr = Xtr_pool[rng.integers(0, len(Xtr_pool), R.N_TRAIN)]
+        for N in N_VALUES:
+            for dn, df in decoders.items():
+                torch.manual_seed(s)
+                enc, dec = R.EdgeEncoder(N), df(N)
+                R.train(enc, dec, Xtr, Xte, EPOCHS)
+                enc.eval(); dec.eval()
+                with torch.no_grad():
+                    z = enc(Xte)
+                    for sig in SIGMAS:
+                        zc = z + sig * torch.randn(z.shape, generator=g)
+                        res[(dn, N, sig)].append(float(((dec(zc) - Xte) ** 2).mean()))
+                print(f"  [seed {s} N={N} {dn}] done", flush=True)
+
+    Nshow = 8 if 8 in N_VALUES else N_VALUES[-1]
+    print(f"\n{'dec':<8}{'N':>3}{'sigma':>7}{'MSE':>10}")
+    for dn in decoders:
+        for N in N_VALUES:
+            for sig in SIGMAS:
+                print(f"{dn:<8}{N:>3}{sig:>7.2f}{_ms(res, (dn, N, sig))[0]:>10.4f}")
+    _plot({dn: [(sig, *_ms(res, (dn, Nshow, sig))) for sig in SIGMAS] for dn in decoders},
+          "latent noise std (more channel noise →)", f"Channel-noise robustness at N={Nshow}",
+          "results_noise.png", invert=False)
+
+
+# -------------------- parameff: parameter-efficiency Pareto at N=8 --------------------
+def parameff(a):
+    N = 8
+    SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
+    EPOCHS = a.epochs or (5 if a.quick else 60)
+    decs = {"amplitude (q)": lambda: R.amplitude_decoder(N), "low-rank cls": lambda: R.lowrank_classical_decoder(N),
+            "hybrid": lambda: R.quantum_decoder(N), "pure": lambda: R.pure_classical_decoder(N),
+            "matched": lambda: R.matched_classical_decoder(N)}
+    Xtr_pool, Xte = R.load_d256()
+    print(f"[parameff] N={N} seeds={SEEDS} epochs={EPOCHS}\n")
+    mse, params = defaultdict(list), {}
+    for s in SEEDS:
+        rng = np.random.default_rng(s)
+        Xtr = Xtr_pool[rng.integers(0, len(Xtr_pool), R.N_TRAIN)]
+        for name, df in decs.items():
+            torch.manual_seed(s)
+            enc, dec = R.EdgeEncoder(N), df()
+            mse[name].append(R.train(enc, dec, Xtr, Xte, EPOCHS))
+            params[name] = sum(p.numel() for p in dec.parameters())
+            print(f"  [seed {s}] {name:<14} mse={mse[name][-1]:.4f} params={params[name]}", flush=True)
+    print(f"\n{'decoder':<14}{'params':>10}{'MSE':>10}")
+    for name in decs:
+        print(f"{name:<14}{params[name]:>10}{_ms(mse, name)[0]:>10.4f}")
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        colors = {"hybrid": "#1f77b4", "matched": "#ff7f0e"}
-
-        # (1) rate-distortion: all (N,b) points + Pareto frontier (best MSE at <= payload bits)
-        plt.figure(figsize=(8, 5))
-        for mname in DECODERS:
-            pts = sorted((N * b, agg((mname, N, b))[0]) for N in N_VALUES for b in BITS)
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            plt.scatter(xs, ys, s=22, alpha=0.4, color=colors[mname])
-            front_x, front_y, best = [], [], float("inf")
-            for x_, y_ in pts:                          # cumulative-min MSE = achievable frontier
-                best = min(best, y_)
-                front_x.append(x_); front_y.append(best)
-            plt.plot(front_x, front_y, "-o", color=colors[mname], lw=2,
-                     label=f"{mname} (best achievable)")
-        plt.xscale("log")
-        plt.xlabel("payload per window = N x bits   (fewer bits ←)")
-        plt.ylabel("reconstruction MSE   (lower is better ↓)")
-        plt.title("Rate-distortion: does the quantum advantage survive quantization? (UCI HAR)")
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("results_quantization.png", dpi=140)
-
-        # (2) detail at N=8 (the sweet spot): MSE vs bits, hybrid vs matched
-        plt.figure(figsize=(7, 4.5))
-        for mname in DECODERS:
-            ys = [agg((mname, 8, b))[0] for b in BITS]
-            es = [agg((mname, 8, b))[1] for b in BITS]
-            plt.errorbar(BITS, ys, yerr=es, marker="o", capsize=4, color=colors[mname], label=mname)
-        plt.gca().invert_xaxis()                         # fewer bits to the right (more compression)
-        plt.xlabel("bits per latent value   (more compression →)")
-        plt.ylabel("reconstruction MSE   (lower is better ↓)")
-        plt.title("Quantization at N=8 (32x): hybrid vs. classical")
-        plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-        plt.savefig("results_quantization_N8.png", dpi=140)
-        print("Saved -> results_quantization.png, results_quantization_N8.png")
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        plt.figure(figsize=(7.5, 5))
+        for name in decs:
+            q = "q" in name or name == "hybrid"
+            m, sd = _ms(mse, name)
+            plt.errorbar(params[name], m, yerr=sd, marker="o" if q else "s", ms=9, capsize=4,
+                         color="#1f77b4" if q else "#ff7f0e")
+            plt.annotate(name, (params[name], m), fontsize=8, textcoords="offset points", xytext=(6, 5))
+        plt.xscale("log"); plt.xlabel("decoder params (fewer ←)"); plt.ylabel("MSE (lower ↓)")
+        plt.title(f"Parameter efficiency at N={N}"); plt.grid(alpha=.3); plt.tight_layout()
+        plt.savefig("results_param_efficiency.png", dpi=140)
+        print("Saved -> results_param_efficiency.png")
     except Exception as e:
         print(f"(plot skipped: {e})")
+
+
+# -------------------- shared plot (MSE vs x, hybrid vs matched) --------------------
+def _plot(series, xlabel, title, fname, invert):
+    try:
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        col = {"hybrid": "#1f77b4", "matched": "#ff7f0e"}
+        plt.figure(figsize=(7, 4.5))
+        for name, pts in series.items():
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]; es = [p[2] for p in pts]
+            plt.errorbar(xs, ys, yerr=es, marker="o", capsize=4, color=col.get(name), label=name)
+        if invert:
+            plt.gca().invert_xaxis()
+        plt.xlabel(xlabel); plt.ylabel("reconstruction MSE (lower ↓)"); plt.title(title)
+        plt.legend(); plt.grid(alpha=.3); plt.tight_layout()
+        plt.savefig(fname, dpi=140)
+        print(f"Saved -> {fname}")
+    except Exception as e:
+        print(f"(plot skipped: {e})")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Evaluation experiments (quant / noise / parameff)")
+    sub = p.add_subparsers(dest="mode", required=True)
+    for m in ("quant", "noise", "parameff"):
+        sp = sub.add_parser(m)
+        sp.add_argument("--encoder", default="cnn", choices=["cnn", "gru"])
+        sp.add_argument("--quick", action="store_true")
+        sp.add_argument("--epochs", type=int, default=None)
+        sp.add_argument("--seeds", type=int, nargs="+", default=None)
+    a = p.parse_args()
+    R.ENCODER_KIND = a.encoder
+    {"quant": quant, "noise": noise, "parameff": parameff}[a.mode](a)
 
 
 if __name__ == "__main__":

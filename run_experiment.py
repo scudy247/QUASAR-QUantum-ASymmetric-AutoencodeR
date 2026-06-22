@@ -43,7 +43,10 @@ RUN
 """
 
 import os
+import sys
 import warnings
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_v, "8")        # cap threads BEFORE numpy/torch import (32-core shared box)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -51,6 +54,7 @@ import pennylane as qml
 
 from data import load_dataset
 
+torch.set_num_threads(8)
 warnings.filterwarnings("ignore")   # silence benign torch/pennylane deprecation chatter
 
 # ---- hyperparameters (tweak these) ------------------------------------------
@@ -62,6 +66,8 @@ EPOCHS = 60                      # training epochs (full-batch Adam)
 LR = 0.01                        # learning rate
 N_TRAIN, N_TEST = 1200, 1000     # samples used per run
 SEEDS = [0, 1, 2, 3, 4, 5, 6, 7] # repeats -> error bars (more seeds = tighter bars)
+ENCODER_KIND = os.environ.get("QIC_ENCODER", "cnn").lower()  # "cnn" | "gru" (env or --encoder)
+RNN_HIDDEN = 32                  # GRU hidden size; ~14.5 KB encoder (< 66 KB edge budget)
 
 
 # ---- data: real UCI HAR turned into a D=256 multi-modal vector ---------------
@@ -93,7 +99,8 @@ CHANNELS = 2                      # raw input is 2 HAR channels (body_acc_x, bod
 # shared across time, capturing local temporal structure (the transient spikes a flat dense
 # layer smears). Output: compressed latent z in [-1,1]^N (Tanh-bounded), transmitted as-is.
 # The device does NOT know the cloud is quantum -- angle embedding is the cloud's job (Phase 2).
-class EdgeEncoder(nn.Module):
+class CNNEncoder(nn.Module):
+    """1D-CNN encoder: convolutions over the (2 x 128) inertial signals (weights shared over time)."""
     def __init__(self, N):
         super().__init__()
         L = D // CHANNELS                                  # samples per channel (128)
@@ -108,6 +115,29 @@ class EdgeEncoder(nn.Module):
     def forward(self, x):
         x = x.view(x.size(0), CHANNELS, -1)    # (B, 256) -> (B, 2, 128): restore channel/time layout
         return self.head(self.features(x))     # latent z in [-1, 1]; no quantum-specific scaling
+
+
+class GRUEncoder(nn.Module):
+    """Recurrent encoder: a GRU reads the window as a length-128 sequence of 2-channel samples
+    and compresses its final hidden state to the latent. Captures temporal correlations; still
+    tiny (~14.5 KB at H=32, well under the 66 KB edge budget)."""
+    def __init__(self, N, hidden=None):
+        super().__init__()
+        H = hidden or RNN_HIDDEN
+        self.rnn = nn.GRU(input_size=CHANNELS, hidden_size=H, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(H, N), nn.Tanh())
+
+    def forward(self, x):
+        x = x.view(x.size(0), CHANNELS, -1).transpose(1, 2)   # (B,256)->(B,2,128)->(B,128,2): 128 steps x 2 feats
+        _, h = self.rnn(x)                                     # h: (1, B, H) final hidden state
+        return self.head(h[-1])                                # latent z in [-1, 1]^N
+
+
+def EdgeEncoder(N):
+    """Encoder factory: returns the selected edge encoder. Choose CNN or GRU via the
+    QIC_ENCODER env var ('cnn'/'gru') or run_experiment's --encoder flag; every script that
+    imports EdgeEncoder respects the choice."""
+    return GRUEncoder(N) if ENCODER_KIND == "gru" else CNNEncoder(N)
 
 
 # PHASE 2: quantum cloud decoder. The cloud receives the raw latent z (the N-dim output of
@@ -138,6 +168,43 @@ def matched_classical_decoder(N):
 def pure_classical_decoder(N):
     # Weak baseline: latent expanded straight to D, no middle nonlinearity.
     return nn.Sequential(nn.Linear(N, D))
+
+
+class _AffineReadout(nn.Module):
+    """Elementwise affine + tanh on the 2**N measured probabilities (no mixing across
+    outputs) -> the quantum circuit must carry the reconstruction; this only rescales.
+    Probabilities are ~1/dim, so we pre-scale by `dim` to give the affine usable range."""
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = float(dim)
+        self.w = nn.Parameter(torch.ones(dim))
+        self.b = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, p):
+        return torch.tanh(p * self.scale * self.w + self.b)
+
+
+def amplitude_decoder(N, layers=Q_LAYERS):
+    """Low-parameter quantum decoder: the VQC's 2**N output probabilities ARE the D
+    reconstruction values (requires 2**N == D, e.g. N=8, D=256). The dominant classical
+    Linear(N->D) is removed, so the quantum circuit does the decoding -> far fewer params."""
+    assert 2 ** N == D, f"amplitude readout needs 2**N == D (got 2**{N}={2 ** N}, D={D})"
+    dev = qml.device("default.qubit", wires=N)
+
+    @qml.qnode(dev, interface="torch", diff_method="backprop")
+    def circ(inputs, weights):
+        qml.AngleEmbedding(inputs, wires=range(N))
+        qml.StronglyEntanglingLayers(weights, wires=range(N))
+        return qml.probs(wires=range(N))                 # 2**N = D outputs
+
+    qlayer = qml.qnn.TorchLayer(circ, {"weights": qml.StronglyEntanglingLayers.shape(layers, N)})
+    return nn.Sequential(qlayer, _AffineReadout(D))
+
+
+def lowrank_classical_decoder(N, rank=2):
+    """Fair LOW-parameter classical baseline (N -> rank -> D) so its parameter count can be
+    matched against the amplitude decoder's."""
+    return nn.Sequential(nn.Linear(N, rank), nn.Tanh(), nn.Linear(rank, D))
 
 
 DECODERS = {"hybrid": quantum_decoder,
@@ -173,9 +240,14 @@ def encoder_onnx_kb(encoder, N):
 
 # ---- run the experiment -----------------------------------------------------
 def main():
+    global N_VALUES, SEEDS, EPOCHS, ENCODER_KIND
+    if "--encoder" in sys.argv:                    # pick CNN or GRU at the start
+        ENCODER_KIND = sys.argv[sys.argv.index("--encoder") + 1].lower()
+    if "--quick" in sys.argv:                      # fast smoke test (~30 s) before a heavy run
+        N_VALUES, SEEDS, EPOCHS = [4, 8], [0], 5
     Xtr_pool, Xte = load_d256()
-    print(f"D={D} (2 HAR channels), train pool {tuple(Xtr_pool.shape)}, "
-          f"test {tuple(Xte.shape)}, seeds {SEEDS}\n")
+    print(f"encoder={ENCODER_KIND} | D={D} (2 HAR channels), train pool {tuple(Xtr_pool.shape)}, "
+          f"test {tuple(Xte.shape)}, seeds {SEEDS}, epochs {EPOCHS}\n")
 
     # mse[(N, decoder_name)] -> list of test MSEs, one per seed
     mse = {(N, d): [] for N in N_VALUES for d in DECODERS}

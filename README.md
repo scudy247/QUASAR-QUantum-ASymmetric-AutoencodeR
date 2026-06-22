@@ -34,14 +34,37 @@ End-to-end training (MSE) couples encoder + decoder (Phase 3); deployment export
 encoder** to ONNX (Phase 4). Two classical decoders (`matched`, `pure`) are trained the same
 way as fair baselines, and the latent can be quantized to `b` bits to study rate-distortion.
 
+## How it works
+
+The system is an **asymmetric** autoencoder: the compressor that runs on the device is
+classical and tiny; the decompressor that runs in the cloud is an expressive quantum circuit.
+
+1. **Sense & encode (device, Phase 1).** A window of multi-channel inertial telemetry
+   (2 HAR channels × 128 = 256 values) is compressed by a small 1D-CNN encoder (~5 KB) to a
+   latent `z in [-1,1]^N` (N = 2..10). Only this encoder is deployed on the device.
+2. **Quantize & transmit.** `z` is optionally quantized to `b` bits, so the packet is
+   `N × b` bits — small enough for a bandwidth-starved acoustic / LoRa link.
+3. **Decode (cloud, Phase 2).** A variational quantum circuit angle-embeds `z` onto N qubits,
+   entangles them, measures N expectation values, and a classical `Linear(N→256)` expands
+   them back to the full signal. Only N qubits are simulated, so it scales with the data dim.
+4. **Train then split (Phases 3–4).** Encoder + decoder are trained jointly on reconstruction
+   MSE (gradients flow through the quantum circuit into the encoder); the encoder is then
+   exported to ONNX for the device, while the quantum decoder stays in the cloud.
+
+Research question: does the quantum decoder let the device compress more aggressively (smaller
+N or fewer bits) at equal fidelity than a classical decoder? Every hybrid run is compared
+against `matched`/`pure` classical baselines, and the quantization study maps the
+bits-vs-reconstruction-error trade-off.
+
 ## Files
 
 | File | Role |
 |------|------|
-| `run_experiment.py` | Main multi-seed sweep: CNN encoder + quantum/matched/pure decoders across N. Defines the models reused by the other scripts. |
+| `run.sh` | **One entry point** — edit the switches at the top, then `bash run.sh`. |
+| `run_experiment.py` | Main multi-seed sweep: CNN/GRU encoder + quantum/matched/pure decoders across N. Defines the models reused by the other scripts. |
 | `train_and_deploy.py` | Train one model, then **split** it for deployment: saves `trained_encoder/decoder_N*.pt` + `edge_encoder_N*.onnx`. |
 | `compare_decoders.py` | Focused, multi-seed quantum-vs-classical decoder comparison at one N. |
-| `quantize_eval.py` | Latent **quantization & rate-distortion** study (MSE + SNR vs bits). |
+| `quantize_eval.py` | Evaluation studies with 3 modes: `quant` (rate-distortion), `noise` (channel robustness), `parameff` (parameter-efficiency) — incorporates the former `noise_eval` & `param_efficiency` scripts. |
 | `plot_results.py` | Clear results figure (parses `run_sweep.log`). |
 | `plot_sweep.py` | Post-sweep convergence/reconstruction plots for the CNN encoder. |
 | `data.py` | Loads real UCI HAR (`load_dataset("har")`); synthetic fallback. |
@@ -71,30 +94,37 @@ First run caches the dataset to `datasets/har_cache.npz`.
 
 ## Run everything
 
-All commands from inside `qic/`, using the venv interpreter. Long runs should go in the
-`simulations` tmux session, e.g. `tmux send-keys -t simulations '<cmd> > out.log 2>&1' Enter`.
+**Easiest:** edit the switches at the top of `run.sh` (`ENCODER`, `SMOKE`, `RUN_*`) and launch
+it — ideally inside the `simulations` tmux session for long runs:
 
 ```bash
 cd /home/fabio/Quantum/OurFramework/qic
-
-# 1. Main sweep: hybrid vs classical decoders across compression ratios (multi-seed)
-../.venv/bin/python run_experiment.py        # -> run_sweep.log, edge_encoder_N*.onnx
-../.venv/bin/python plot_results.py          # -> results_hybrid.png (clear figure)
-
-# 2. Latent quantization & rate-distortion (transmitted bits vs reconstruction error)
-../.venv/bin/python quantize_eval.py         # -> results_quantization.png, results_quantization_N8.png
-
-# 3. Focused quantum-vs-classical comparison at one bottleneck
-../.venv/bin/python compare_decoders.py --N 8 --seeds 0 1 2
-
-# 4. Train then split for deployment (saves encoder/decoder .pt + encoder ONNX)
-../.venv/bin/python train_and_deploy.py --N 6 --epochs 80
-
-# 5. Post-sweep plots for the CNN encoder
-../.venv/bin/python plot_sweep.py
+bash run.sh
 ```
 
-Tunable knobs live at the top of each script (`D`, `N_VALUES`, `BITS`, `SEEDS`, `EPOCHS`, ...).
+**Or run pieces by hand** (from `qic/`, with the venv interpreter; `--encoder cnn|gru`, `--quick`):
+
+```bash
+# main sweep: hybrid vs classical decoders across compression ratios (multi-seed)
+../.venv/bin/python run_experiment.py --encoder cnn        # -> results_hybrid.png, edge_encoder_N*.onnx
+
+# evaluation studies (one mode at a time)
+../.venv/bin/python quantize_eval.py quant --encoder cnn   # rate-distortion   -> results_quantization.png
+../.venv/bin/python quantize_eval.py noise --encoder cnn   # channel noise     -> results_noise.png
+../.venv/bin/python quantize_eval.py parameff              # param efficiency  -> results_param_efficiency.png
+
+# extras (kept separate): deployment + a focused comparison + standalone plotters
+../.venv/bin/python train_and_deploy.py --N 6 --epochs 80
+../.venv/bin/python compare_decoders.py --N 8 --seeds 0 1 2
+../.venv/bin/python plot_results.py     # clear sweep figure
+../.venv/bin/python plot_sweep.py       # CNN convergence/reconstruction plots
+```
+
+Add `--quick` to any run for a fast smoke test. Tunable knobs are at the top of each script.
+
+Default is `cnn`. The GRU hidden size is `RNN_HIDDEN` (32 ≈ 14.5 KB; set 64 for ≈ 53 KB) — both
+under the ~66 KB edge budget. Note: the encoder choice does **not** fix peak smoothing (that's the
+N-value bottleneck); it changes how temporal features are extracted.
 
 ## Result (real HAR, D=256, 5 seeds: mean ± std)
 
