@@ -1,0 +1,4 @@
+# regenerable junk only (datasets, result figures and ONNX artifacts are kept)
+__pycache__/
+*.pyc
+*.log

@@ -61,16 +61,12 @@ bits-vs-reconstruction-error trade-off.
 | File | Role |
 |------|------|
 | `run.sh` | **One entry point** — edit the switches at the top, then `bash run.sh`. |
-| `run_experiment.py` | Main multi-seed sweep: CNN/GRU encoder + quantum/matched/pure decoders across N. Defines the models reused by the other scripts. |
-| `train_and_deploy.py` | Train one model, then **split** it for deployment: saves `trained_encoder/decoder_N*.pt` + `edge_encoder_N*.onnx`. |
-| `compare_decoders.py` | Focused, multi-seed quantum-vs-classical decoder comparison at one N. |
-| `quantize_eval.py` | Evaluation studies with 3 modes: `quant` (rate-distortion), `noise` (channel robustness), `parameff` (parameter-efficiency) — incorporates the former `noise_eval` & `param_efficiency` scripts. |
-| `plot_results.py` | Clear results figure (parses `run_sweep.log`). |
-| `plot_sweep.py` | Post-sweep convergence/reconstruction plots for the CNN encoder. |
+| `run_experiment.py` | Main multi-seed sweep: CNN/GRU encoder + quantum/matched/pure decoders across N. Trains end-to-end, exports the edge encoder to ONNX, and saves `results_hybrid.png`. Defines the models reused by `quantize_eval.py`. |
+| `quantize_eval.py` | Evaluation studies with 3 modes: `quant` (rate-distortion), `noise` (channel robustness), `parameff` (parameter-efficiency). |
 | `data.py` | Loads real UCI HAR (`load_dataset("har")`); synthetic fallback. |
 | `datasets/` | UCI HAR inertial signals + `.npz` cache. |
-| `edge_encoder_N*.onnx`, `trained_*_N*.pt` | Deployment artifacts: edge encoder (ONNX) + saved model halves. |
-| `results_*.png` | Figures (main sweep, quantization, reconstructions). |
+| `edge_encoder_N*.onnx` | Deployment artifact: the TinyML edge encoder exported to ONNX (produced by `run_experiment.py`). |
+| `results_*.png` | Result figures: `results_hybrid.png` (sweep), `results_quantization.png`, `results_noise.png`. |
 
 Environment: a Python venv with `torch`, `pennylane`, `pennylane-lightning`,
 `onnx`, `onnxscript`, `scikit-learn`.
@@ -112,12 +108,6 @@ bash run.sh
 ../.venv/bin/python quantize_eval.py quant --encoder cnn   # rate-distortion   -> results_quantization.png
 ../.venv/bin/python quantize_eval.py noise --encoder cnn   # channel noise     -> results_noise.png
 ../.venv/bin/python quantize_eval.py parameff              # param efficiency  -> results_param_efficiency.png
-
-# extras (kept separate): deployment + a focused comparison + standalone plotters
-../.venv/bin/python train_and_deploy.py --N 6 --epochs 80
-../.venv/bin/python compare_decoders.py --N 8 --seeds 0 1 2
-../.venv/bin/python plot_results.py     # clear sweep figure
-../.venv/bin/python plot_sweep.py       # CNN convergence/reconstruction plots
 ```
 
 Add `--quick` to any run for a fast smoke test. Tunable knobs are at the top of each script.
@@ -128,9 +118,10 @@ N-value bottleneck); it changes how temporal features are extracted.
 
 ## Result (real HAR, D=256, 5 seeds: mean ± std)
 
-> Note: this table is from the earlier **MLP** encoder. The current code uses a **1D-CNN**
-> encoder (and a quantization study); results are being regenerated — see `run_sweep.log`
-> and `results_quantization.png`.
+> Note: this table is from the earlier **MLP** encoder and is kept only for context.
+> The current code uses a **1D-CNN** encoder; the authoritative numbers are printed by
+> `run_experiment.py` and plotted to `results_hybrid.png` (plus `results_quantization.png`
+> and `results_noise.png` for the robustness studies).
 
 | N | compression | MSE hybrid | MSE matched-classical | MSE pure-classical | encoder |
 |--:|--:|--:|--:|--:|--:|
