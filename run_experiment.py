@@ -62,12 +62,15 @@ D = 256                          # telemetry dimension: 2 HAR channels x 128 sam
 N_VALUES = [2, 4, 6, 8, 10]      # bottleneck = qubit count -> compression D/N = 128x ... 26x
 HIDDEN = 32                      # encoder hidden width (kept tiny for a TinyML footprint)
 Q_LAYERS = 3                     # depth of the variational quantum circuit
-EPOCHS = 60                      # training epochs (full-batch Adam)
-LR = 0.01                        # learning rate
-N_TRAIN, N_TEST = 1200, 1000     # samples used per run
+EPOCHS = 120                     # training epochs (mini-batch Adam + cosine LR decay)
+LR = 0.01                        # initial learning rate (cosine-decayed to ~0 over training)
+BATCH = 128                      # mini-batch size -> many gradient updates per epoch (vs 1 for full-batch)
+N_TRAIN, N_TEST = 1200, 1000     # N_TRAIN: legacy bootstrap size (the sweep now trains on the full pool)
 SEEDS = [0, 1, 2, 3, 4, 5, 6, 7] # repeats -> error bars (more seeds = tighter bars)
-ENCODER_KIND = os.environ.get("QIC_ENCODER", "cnn").lower()  # "cnn" | "gru" (env or --encoder)
+ENCODER_KIND = os.environ.get("QIC_ENCODER", "cnn").lower()  # "cnn" | "gru" | "fft" (env or --encoder)
 RNN_HIDDEN = 32                  # GRU hidden size; ~14.5 KB encoder (< 66 KB edge budget)
+DECODER_HEAD = os.environ.get("QIC_HEAD", "linear").lower()  # "linear" | "mlp": cloud expansion z->D
+HEAD_HIDDEN = 256                # hidden width of the nonlinear (mlp) decoder head
 
 
 # ---- data: real UCI HAR turned into a D=256 multi-modal vector ---------------
@@ -76,13 +79,21 @@ def load_d256():
       Xtr_pool : full scaled training tensor (each seed bootstraps from this)
       Xte      : a FIXED test subsample (same across seeds, for fair comparison)
     Each sample is two HAR inertial channels (128 each) concatenated -> 256 dims,
-    min-max scaled to [-1, 1] (so it matches the decoder's tanh / <Z> output range)."""
+    min-max scaled to [-1, 1] (so it matches the decoder's tanh / <Z> output range).
+    Scaling is PER CHANNEL (one min/max shared across that channel's 128 time samples),
+    NOT per time-step: a per-instant min/max would apply a different affine to each of the
+    128 positions and warp the within-window waveform. One scalar per channel preserves the
+    signal's temporal shape while still bringing every channel into [-1, 1]."""
     Xtr, _, Xte, _ = load_dataset("har")                  # HAR windows: (num, 9, 128)
     prep = lambda X: np.concatenate([X[:, 0, :], X[:, 1, :]], axis=1)   # 2 channels -> 256
     Xtr, Xte = prep(Xtr), prep(Xte)
-    mn, mx = Xtr.min(0), Xtr.max(0)                        # scale using TRAIN stats only
+    L = D // CHANNELS                                      # samples per channel (128)
+    tr3 = Xtr.reshape(len(Xtr), CHANNELS, L)              # (num, 2, 128): expose the channel axis
+    mn = tr3.min(axis=(0, 2), keepdims=True)             # per-channel min over TRAIN samples & time
+    mx = tr3.max(axis=(0, 2), keepdims=True)             # -> shape (1, CHANNELS, 1), broadcasts over time
     span = np.where(mx - mn == 0, 1.0, mx - mn)
-    sc = lambda A: (2 * (A - mn) / span - 1).astype(np.float32)
+    sc = lambda A: (2 * (A.reshape(len(A), CHANNELS, L) - mn) / span - 1
+                    ).reshape(len(A), D).astype(np.float32)
     Xtr, Xte = sc(Xtr), sc(Xte)
     r = np.random.default_rng(0)
     Xte_fixed = torch.tensor(Xte[r.choice(len(Xte), N_TEST, replace=False)])
@@ -133,41 +144,81 @@ class GRUEncoder(nn.Module):
         return self.head(h[-1])                                # latent z in [-1, 1]^N
 
 
+class FFTEncoder(nn.Module):
+    """Frequency-domain encoder. Takes the real FFT of each channel and keeps BOTH the real and
+    imaginary parts (i.e. magnitude AND phase) -- phase is what encodes *where* a transient sits
+    in time, so we must not drop it. A small MLP then LEARNS which spectral components matter
+    (not a naive top-k truncation), letting the device allocate the N latents across low/high
+    frequencies. Motivation: sharp peaks are broadband in frequency; an explicit spectral view
+    may help the encoder preserve them better than a time-domain CNN. Output: z in [-1,1]^N."""
+    def __init__(self, N, hidden=None):
+        super().__init__()
+        L = D // CHANNELS                          # samples per channel (128)
+        bins = L // 2 + 1                          # rfft output length (65)
+        feat = CHANNELS * bins * 2                 # real + imag, both channels (260)
+        H = hidden or HIDDEN
+        self.head = nn.Sequential(nn.Linear(feat, H), nn.ReLU(), nn.Linear(H, N), nn.Tanh())
+
+    def forward(self, x):
+        x = x.view(x.size(0), CHANNELS, -1)        # (B, 256) -> (B, 2, 128): restore channel/time
+        Xf = torch.fft.rfft(x, dim=-1)             # (B, 2, 65) complex spectrum per channel
+        feats = torch.cat([Xf.real, Xf.imag], dim=-1).flatten(1)  # keep phase; -> (B, 260)
+        return self.head(feats)                    # latent z in [-1, 1]; no quantum-specific scaling
+
+
 def EdgeEncoder(N):
-    """Encoder factory: returns the selected edge encoder. Choose CNN or GRU via the
-    QIC_ENCODER env var ('cnn'/'gru') or run_experiment's --encoder flag; every script that
-    imports EdgeEncoder respects the choice."""
-    return GRUEncoder(N) if ENCODER_KIND == "gru" else CNNEncoder(N)
+    """Encoder factory: returns the selected edge encoder. Choose CNN, GRU or FFT via the
+    QIC_ENCODER env var ('cnn'/'gru'/'fft') or run_experiment's --encoder flag; every script
+    that imports EdgeEncoder respects the choice."""
+    if ENCODER_KIND == "gru":
+        return GRUEncoder(N)
+    if ENCODER_KIND == "fft":
+        return FFTEncoder(N)
+    return CNNEncoder(N)
+
+
+def _expansion(N):
+    """Cloud-side expansion: maps the N decoder features back up to the full D telemetry.
+    'linear' (default) = the original Linear(N -> D), an essentially LINEAR reconstruction
+    that cannot beat the PCA floor. 'mlp' = a nonlinear head (Linear -> ReLU -> Linear); the
+    cloud is unconstrained, so this can exploit nonlinear manifold structure and lower MSE at
+    the SAME bottleneck N (no extra qubits, no extra transmitted data). Set via QIC_HEAD."""
+    if DECODER_HEAD == "mlp":
+        return nn.Sequential(nn.Linear(N, HEAD_HIDDEN), nn.ReLU(), nn.Linear(HEAD_HIDDEN, D))
+    return nn.Linear(N, D)
 
 
 # PHASE 2: quantum cloud decoder. The cloud receives the raw latent z (the N-dim output of
 # the classical encoder) from the (dummy) device and does the angle embedding ITSELF as its
-# FIRST step: qml.AngleEmbedding consumes the encoder output directly as qubit rotation angles
-# (no scaling -- the encoder learns suitable values; len(features)=N <= N qubits is required
-# and is guaranteed here since both equal N). BasicEntanglerLayers then mixes them; we read N
-# Pauli-Z expectation values; finally a classical Linear(N -> D) expands back to full telemetry.
+# FIRST step: qml.AngleEmbedding consumes the encoder output as qubit rotation angles. The
+# device still ships raw z in [-1,1] (no quantum-specific scaling on-device); the CLOUD maps
+# that to the full RX range by multiplying by pi, so the data-dependent rotations span
+# [-pi, pi] (a full turn) instead of just +/-1 rad -- this widens the encoding's frequency
+# content / input separability without changing what the device transmits. len(features)=N
+# <= N qubits is required and guaranteed (both equal N). BasicEntanglerLayers then mixes them;
+# we read N Pauli-Z expectation values; a classical Linear(N -> D) expands back to telemetry.
 def quantum_decoder(N):
     dev = qml.device("lightning.qubit", wires=N)        # fast C++ simulator
 
     @qml.qnode(dev, interface="torch", diff_method="adjoint")   # memory-efficient grads
     def circ(inputs, weights):
-        qml.AngleEmbedding(inputs, wires=range(N))         # FIRST cloud step: embed encoder output directly
+        qml.AngleEmbedding(inputs * np.pi, wires=range(N))  # cloud-side scale: [-1,1] -> [-pi,pi] RX range
         qml.BasicEntanglerLayers(weights, wires=range(N))  # parameterized entangling layers
         return [qml.expval(qml.PauliZ(i)) for i in range(N)]
 
     # TorchLayer makes the quantum circuit a normal PyTorch layer (trainable weights inside).
     qlayer = qml.qnn.TorchLayer(circ, {"weights": (Q_LAYERS, N)})
-    return nn.Sequential(qlayer, nn.Linear(N, D))          # VQC + classical expansion
+    return nn.Sequential(qlayer, _expansion(N))            # VQC + classical expansion (linear|mlp)
 
 
 def matched_classical_decoder(N):
     # FAIR baseline: replace the quantum N->N map with a classical N->N map (Linear+Tanh).
-    return nn.Sequential(nn.Linear(N, N), nn.Tanh(), nn.Linear(N, D))
+    return nn.Sequential(nn.Linear(N, N), nn.Tanh(), _expansion(N))
 
 
 def pure_classical_decoder(N):
-    # Weak baseline: latent expanded straight to D, no middle nonlinearity.
-    return nn.Sequential(nn.Linear(N, D))
+    # Weak baseline: no middle block -- just the cloud expansion (linear|mlp) straight from z.
+    return _expansion(N)
 
 
 class _AffineReadout(nn.Module):
@@ -193,7 +244,7 @@ def amplitude_decoder(N, layers=Q_LAYERS):
 
     @qml.qnode(dev, interface="torch", diff_method="backprop")
     def circ(inputs, weights):
-        qml.AngleEmbedding(inputs, wires=range(N))
+        qml.AngleEmbedding(inputs * np.pi, wires=range(N))  # cloud-side scale: [-1,1] -> [-pi,pi] RX range
         qml.StronglyEntanglingLayers(weights, wires=range(N))
         return qml.probs(wires=range(N))                 # 2**N = D outputs
 
@@ -218,12 +269,18 @@ DECODERS = {"hybrid": quantum_decoder,
 def train(encoder, decoder, Xtr, Xte, epochs=EPOCHS):
     model = nn.Sequential(encoder, decoder)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)  # LR: LR -> ~0 (settle into the minimum)
     loss_fn = nn.MSELoss()
+    n = len(Xtr)
     for _ in range(epochs):
-        opt.zero_grad()
-        loss = loss_fn(model(Xtr), Xtr)        # autoencoder: target == input
-        loss.backward()
-        opt.step()
+        perm = torch.randperm(n)               # shuffle each epoch
+        for i in range(0, n, BATCH):           # mini-batches: ~n/BATCH gradient updates per epoch
+            xb = Xtr[perm[i:i + BATCH]]
+            opt.zero_grad()
+            loss = loss_fn(model(xb), xb)      # autoencoder: target == input
+            loss.backward()
+            opt.step()
+        sched.step()
     with torch.no_grad():
         return float(loss_fn(model(Xte), Xte))
 
@@ -233,18 +290,28 @@ def train(encoder, decoder, Xtr, Xte, epochs=EPOCHS):
 def encoder_onnx_kb(encoder, N):
     path = f"edge_encoder_N{N}.onnx"
     encoder.eval()
-    torch.onnx.export(encoder, torch.randn(1, D), path,
-                      input_names=["raw_sensor"], output_names=["latent_z"])
-    return os.path.getsize(path) / 1024
+    try:
+        torch.onnx.export(encoder, torch.randn(1, D), path,
+                          input_names=["raw_sensor"], output_names=["latent_z"])
+        return os.path.getsize(path) / 1024
+    except Exception:
+        return float("nan")    # some ops (e.g. FFT) may not export to ONNX cleanly; skip sizing
+
 
 
 # ---- run the experiment -----------------------------------------------------
 def main():
-    global N_VALUES, SEEDS, EPOCHS, ENCODER_KIND
-    if "--encoder" in sys.argv:                    # pick CNN or GRU at the start
+    global N_VALUES, SEEDS, EPOCHS, BATCH, ENCODER_KIND
+    if "--encoder" in sys.argv:                    # pick CNN/GRU/FFT at the start
         ENCODER_KIND = sys.argv[sys.argv.index("--encoder") + 1].lower()
-    if "--quick" in sys.argv:                      # fast smoke test (~30 s) before a heavy run
-        N_VALUES, SEEDS, EPOCHS = [4, 8], [0], 5
+    if "--quick" in sys.argv:                      # fast smoke test before a heavy run
+        N_VALUES, SEEDS, EPOCHS = [4, 8], [0], 15
+    if "--epochs" in sys.argv:                      # override training length
+        EPOCHS = int(sys.argv[sys.argv.index("--epochs") + 1])
+    if "--nseeds" in sys.argv:                      # use seeds 0..n-1 (fewer = faster validation)
+        SEEDS = list(range(int(sys.argv[sys.argv.index("--nseeds") + 1])))
+    if "--batch" in sys.argv:
+        BATCH = int(sys.argv[sys.argv.index("--batch") + 1])
     Xtr_pool, Xte = load_d256()
     print(f"encoder={ENCODER_KIND} | D={D} (2 HAR channels), train pool {tuple(Xtr_pool.shape)}, "
           f"test {tuple(Xte.shape)}, seeds {SEEDS}, epochs {EPOCHS}\n")
@@ -252,8 +319,7 @@ def main():
     # mse[(N, decoder_name)] -> list of test MSEs, one per seed
     mse = {(N, d): [] for N in N_VALUES for d in DECODERS}
     for si, seed in enumerate(SEEDS):
-        rng = np.random.default_rng(seed)
-        Xtr = Xtr_pool[rng.integers(0, len(Xtr_pool), N_TRAIN)]   # bootstrap training set
+        Xtr = Xtr_pool                                            # full training set (per-seed variation = init + shuffle)
         for N in N_VALUES:
             for dname, dfn in DECODERS.items():
                 torch.manual_seed(seed)                           # identical encoder init per seed
