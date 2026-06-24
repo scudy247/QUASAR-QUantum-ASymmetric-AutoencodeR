@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 *.log
+
+# dataset is downloaded per README, not committed
+datasets/
+.DS_Store
+__MACOSX/
