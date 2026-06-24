@@ -37,6 +37,8 @@ def quant(a):
     SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
     EPOCHS = a.epochs or (5 if a.quick else 50)
     decoders = {"hybrid": R.quantum_decoder, "matched": R.matched_classical_decoder}
+    if getattr(a, "control", False):
+        decoders["bounded"] = R.bounded_classical_decoder   # F4 bounded-gain control (cos/sin map)
     Xtr_pool, Xte = R.load_d256()
     print(f"[quant] encoder={R.ENCODER_KIND} N={N_VALUES} bits={BITS} seeds={SEEDS}\n")
 
@@ -78,6 +80,8 @@ def noise(a):
     SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
     EPOCHS = a.epochs or (5 if a.quick else 50)
     decoders = {"hybrid": R.quantum_decoder, "matched": R.matched_classical_decoder}
+    if getattr(a, "control", False):
+        decoders["bounded"] = R.bounded_classical_decoder   # F4 bounded-gain control (cos/sin map)
     Xtr_pool, Xte = R.load_d256()
     print(f"[noise] encoder={R.ENCODER_KIND} N={N_VALUES} sigmas={SIGMAS} seeds={SEEDS}\n")
 
@@ -154,7 +158,7 @@ def parameff(a):
 def _plot(series, xlabel, title, fname, invert):
     try:
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-        col = {"hybrid": "#1f77b4", "matched": "#ff7f0e"}
+        col = {"hybrid": "#1f77b4", "matched": "#ff7f0e", "bounded": "#2ca02c"}
         plt.figure(figsize=(7, 4.5))
         for name, pts in series.items():
             xs = [p[0] for p in pts]; ys = [p[1] for p in pts]; es = [p[2] for p in pts]
@@ -178,6 +182,7 @@ def main():
         sp.add_argument("--quick", action="store_true")
         sp.add_argument("--epochs", type=int, default=None)
         sp.add_argument("--seeds", type=int, nargs="+", default=None)
+        sp.add_argument("--control", action="store_true")   # F4: add bounded-gain classical decoder
     a = p.parse_args()
     R.ENCODER_KIND = a.encoder
     {"quant": quant, "noise": noise, "parameff": parameff}[a.mode](a)

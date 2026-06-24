@@ -222,11 +222,14 @@ def pure_classical_decoder(N):
 
 
 class _CosSinFeatures(nn.Module):
-    """Classical analogue of the quantum decoder's response: map z -> [cos(pi z), sin(pi z)].
-    These are smooth and Lipschitz-bounded (|d/dz| <= pi), exactly like the <Z>-style outputs of
-    the VQC -- so they cannot amplify quantization noise either. No trainable params, no qubits."""
+    """Classical analogue of the quantum decoder's response: map z -> [cos(pi/2 z), sin(pi/2 z)].
+    Smooth and Lipschitz-bounded (|d/dz| <= pi/2), like the <Z>-style outputs of the VQC, so it
+    cannot amplify quantization noise. We use HALF frequency (pi/2, not pi) on purpose: at pi the
+    map is degenerate at z=+/-1 (cos(+/-pi)=-1, sin(+/-pi)=0 -> both 1-bit levels collapse to the
+    same feature, losing the sign). pi/2 keeps z=+1 -> (0,+1), z=-1 -> (0,-1): bounded AND
+    injective at the 1-bit levels, so it's a fair bounded-gain baseline. No trainable params."""
     def forward(self, z):
-        return torch.cat([torch.cos(np.pi * z), torch.sin(np.pi * z)], dim=-1)
+        return torch.cat([torch.cos(0.5 * np.pi * z), torch.sin(0.5 * np.pi * z)], dim=-1)
 
 
 def bounded_classical_decoder(N):
