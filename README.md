@@ -7,7 +7,7 @@ decoder** reconstructs the full signal. Trained end-to-end; only the encoder is 
 ```
 DEVICE (dummy):  x in R^D --[Phase1: classical edge encoder, TinyML]--> z in [-1,1]^N  (N << D)
                  --> transmit z   (no quantum-specific scaling on the device)
-CLOUD:           z --[qml.AngleEmbedding(z): embeds encoder output directly]--> [VQC on N qubits]
+CLOUD:           z --[qml.AngleEmbedding(pi*z): cloud scales [-1,1] -> [-pi,pi]]--> [VQC on N qubits]
                  --> <Z_i> (N values) --[classical Linear N->D]--> x_hat in R^D
 ```
 
@@ -61,12 +61,18 @@ bits-vs-reconstruction-error trade-off.
 | File | Role |
 |------|------|
 | `run.sh` | **One entry point** — edit the switches at the top, then `bash run.sh`. |
-| `run_experiment.py` | Main multi-seed sweep: CNN/GRU encoder + quantum/matched/pure decoders across N. Trains end-to-end, exports the edge encoder to ONNX, and saves `results_hybrid.png`. Defines the models reused by `quantize_eval.py`. |
-| `quantize_eval.py` | Evaluation studies with 3 modes: `quant` (rate-distortion), `noise` (channel robustness), `parameff` (parameter-efficiency). |
+| `run_experiment.py` | Main multi-seed sweep: CNN/GRU/FFT encoder + quantum/matched/pure decoders across N. Trains end-to-end, exports the edge encoder to ONNX, saves `results_hybrid.png`. Defines the models (incl. the bounded-gain control) reused by `quantize_eval.py`. |
+| `quantize_eval.py` | Evaluation studies with 3 modes: `quant` (rate-distortion), `noise` (channel robustness), `parameff` (parameter-efficiency). `--control` adds the bounded-gain classical decoder. |
+| `_floor_probe.py` | Diagnostic: PCA reconstruction floor vs linear vs MLP decoder head per N (shows how much MSE is achievable). |
 | `data.py` | Loads real UCI HAR (`load_dataset("har")`); synthetic fallback. |
-| `datasets/` | UCI HAR inertial signals + `.npz` cache. |
+| `datasets/` | UCI HAR data — **not in git**, downloaded per the Setup section below (cached to `har_cache.npz` on first run). |
 | `edge_encoder_N*.onnx` | Deployment artifact: the TinyML edge encoder exported to ONNX (produced by `run_experiment.py`). |
 | `results_*.png` | Result figures: `results_hybrid.png` (sweep), `results_quantization.png`, `results_noise.png`. |
+
+**Model knobs (env vars / flags):** `QIC_ENCODER` or `--encoder` (`cnn`/`gru`/`fft`); `QIC_HEAD`
+(`linear` default, or `mlp` for a nonlinear cloud decoder head); `--control` (add the bounded-gain
+classical decoder to the eval). The angle embedding is π-scaled cloud-side and the input is
+min-max normalized **per channel** (preserves waveform shape).
 
 Environment: a Python venv with `torch`, `pennylane`, `pennylane-lightning`,
 `onnx`, `onnxscript`, `scikit-learn`.
@@ -105,10 +111,14 @@ bash run.sh
 ../.venv/bin/python run_experiment.py --encoder cnn        # -> results_hybrid.png, edge_encoder_N*.onnx
 
 # evaluation studies (one mode at a time)
-../.venv/bin/python quantize_eval.py quant --encoder cnn   # rate-distortion   -> results_quantization.png
-../.venv/bin/python quantize_eval.py noise --encoder cnn   # channel noise     -> results_noise.png
-../.venv/bin/python quantize_eval.py parameff              # param efficiency  -> results_param_efficiency.png
+../.venv/bin/python quantize_eval.py quant --encoder cnn            # rate-distortion -> results_quantization.png
+../.venv/bin/python quantize_eval.py quant --encoder cnn --control  # + bounded-gain control decoder
+../.venv/bin/python quantize_eval.py noise --encoder cnn            # channel noise   -> results_noise.png
+../.venv/bin/python quantize_eval.py parameff                       # param efficiency
 ```
+
+Multi-seed paper runs add `--seeds 0 1 2 3 4 --epochs 80`. Set `QIC_HEAD=mlp` to swap the linear
+cloud decoder for a nonlinear MLP head (lowers reconstruction MSE; see `_floor_probe.py`).
 
 Add `--quick` to any run for a fast smoke test. Tunable knobs are at the top of each script.
 
@@ -116,36 +126,43 @@ Default is `cnn`. The GRU hidden size is `RNN_HIDDEN` (32 ≈ 14.5 KB; set 64 fo
 under the ~66 KB edge budget. Note: the encoder choice does **not** fix peak smoothing (that's the
 N-value bottleneck); it changes how temporal features are extracted.
 
-## Result (real HAR, D=256, 5 seeds: mean ± std)
+## Result (real HAR, D=256, 1D-CNN encoder, 5 seeds, 80 epochs)
 
-> Note: this table is from the earlier **MLP** encoder and is kept only for context.
-> The current code uses a **1D-CNN** encoder; the authoritative numbers are printed by
-> `run_experiment.py` and plotted to `results_hybrid.png` (plus `results_quantization.png`
-> and `results_noise.png` for the robustness studies).
+The authoritative numbers are printed by the scripts and plotted to `results_*.png`. Summary of
+where things stand:
 
-| N | compression | MSE hybrid | MSE matched-classical | MSE pure-classical | encoder |
+**1. Full-precision reconstruction is a tie.** Across N, hybrid ≈ matched ≈ pure; with proper
+training the classical decoders are if anything *slightly better*. The quantum decoder does **not**
+improve reconstruction MSE — the bottleneck is N (the linear-head AE already sits at the PCA floor;
+a nonlinear `QIC_HEAD=mlp` head recovers ~15%, but for *all* decoders).
+
+**2. The real effect is graceful degradation under aggressive quantization.** Reconstruction MSE
+vs bits-per-latent (`quant`, N×b-bit payload):
+
+| N | 8 bit | 2 bit | 1 bit (hybrid) | 1 bit (matched) | 1-bit gap |
 |--:|--:|--:|--:|--:|--:|
-| 2 | 128× | 0.0365 ± .0042 | 0.0338 ± .0023 | 0.0352 ± .0020 | 7.0 KB |
-| 4 | 64×  | 0.0285 ± .0004 | 0.0288 ± .0003 | 0.0291 ± .0001 | 6.9 KB |
-| 8 | 32×  | 0.0253 ± .0009 | 0.0267 ± .0013 | 0.0280 ± .0005 | 6.9 KB |
+| 8 | h 0.0094 / m 0.0090 | h 0.0266 / m 0.0242 | **0.0336** | 0.1379 | **4.1×** |
+| 10 | h 0.0095 / m 0.0085 | h 0.0236 / m 0.0288 | **0.0261** | 0.1700 | **6.5×** |
 
-**Honest reading** (matched-classical is the fair test — same encoder + expansion, only the
-middle N->N block differs):
+At ≥3 bits the classical decoder is **better or tied**. At **1 bit** the classical decoder
+*collapses* while the hybrid degrades gracefully, and the gap **grows with N**. So the defensible
+claim is narrow but real: *the quantum decoder is a fail-safe at extreme (1-bit) compression*, not
+a general efficiency win.
 
-- 128×: hybrid slightly *worse* than matched (error bars overlap) — a wash.
-- 64×:  statistically **tied**.
-- 32×:  hybrid shows a **small edge** (0.0253 vs 0.0267), but the ~1σ bands still overlap.
-- The hybrid consistently beats *pure*-classical (no middle layer) — expected, weak baseline.
+**Honest caveats (must address before claiming a quantum advantage):**
 
-**Supported claims:** comparable fidelity at 32-128× with a **~7 KB TinyML edge encoder**;
-simulatable at large D; a *suggestive (not conclusive)* small benefit at moderate (32×)
-compression. **Not yet supported:** a robust "outperforms classical AEs" — the edge is within
-~1σ and inconsistent across N; more seeds / a second dataset would be needed to claim it.
+- **Post-training quantization only** — quantization-aware training (QAT) may let the classical
+  decoder close the 1-bit gap; untested.
+- **Bounded-gain vs quantum** — the classical decoder may collapse at 1 bit simply because its
+  unbounded weights amplify quantization noise. The `--control` bounded-gain classical decoder
+  tests whether the robustness is genuinely *quantum* or reproducible by any bounded map.
+- **System-level, not decoder-level** — each system's encoder is trained jointly with its own
+  decoder, so the comparison isn't a clean decoder isolation (a frozen-encoder swap would be).
 
 ## Caveats / next steps
 
-- Single seed; MSE gaps (~0.0005) are likely within noise -> add a seed loop for mean+/-std
-  to firmly establish parity (each run is ~15 s).
+- Re-run `results_hybrid.png` with `--nseeds 5` (currently a smoke); finish the `noise` run; run
+  the `--control` rate-distortion to settle the quantum-vs-bounded-gain question.
 - "PAoI reduction" = payload/compression ratio only (ignores propagation); not a true PAoI.
 - Older directions (quantum-inspired transform coding, symmetric QAE) are archived in
   `/home/fabio/Quantum/_ourframework_old_workflows.tgz`.
