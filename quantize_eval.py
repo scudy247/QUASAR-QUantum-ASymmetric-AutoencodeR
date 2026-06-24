@@ -32,7 +32,7 @@ def _ms(d, k):
 
 # -------------------- quant: latent quantization / rate-distortion --------------------
 def quant(a):
-    N_VALUES = [4, 8] if a.quick else [4, 6, 8, 10]
+    N_VALUES = [4, 8] if a.quick else [2, 4, 6, 8, 10]
     BITS = [4, 1] if a.quick else [8, 4, 3, 2, 1]
     SEEDS = a.seeds or ([0] if a.quick else [0, 1, 2])
     EPOCHS = a.epochs or (5 if a.quick else 50)
