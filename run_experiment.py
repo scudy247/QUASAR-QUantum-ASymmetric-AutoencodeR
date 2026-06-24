@@ -221,6 +221,21 @@ def pure_classical_decoder(N):
     return _expansion(N)
 
 
+class _CosSinFeatures(nn.Module):
+    """Classical analogue of the quantum decoder's response: map z -> [cos(pi z), sin(pi z)].
+    These are smooth and Lipschitz-bounded (|d/dz| <= pi), exactly like the <Z>-style outputs of
+    the VQC -- so they cannot amplify quantization noise either. No trainable params, no qubits."""
+    def forward(self, z):
+        return torch.cat([torch.cos(np.pi * z), torch.sin(np.pi * z)], dim=-1)
+
+
+def bounded_classical_decoder(N):
+    """F4 control: a BOUNDED-GAIN classical decoder. If this matches the hybrid's low-bit
+    robustness, the advantage is 'bounded/smooth decoder', not 'quantum'. If it does NOT, the
+    quantum circuit is doing something a cheap classical bounded map can't -- a stronger claim."""
+    return nn.Sequential(_CosSinFeatures(), nn.Linear(2 * N, D))
+
+
 class _AffineReadout(nn.Module):
     """Elementwise affine + tanh on the 2**N measured probabilities (no mixing across
     outputs) -> the quantum circuit must carry the reconstruction; this only rescales.
