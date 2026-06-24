@@ -139,15 +139,18 @@ a nonlinear `QIC_HEAD=mlp` head recovers ~15%, but for *all* decoders).
 **2. The real effect is graceful degradation under aggressive quantization.** Reconstruction MSE
 vs bits-per-latent (`quant`, N×b-bit payload):
 
-| N | 8 bit | 2 bit | 1 bit (hybrid) | 1 bit (matched) | 1-bit gap |
-|--:|--:|--:|--:|--:|--:|
-| 8 | h 0.0094 / m 0.0090 | h 0.0266 / m 0.0242 | **0.0336** | 0.1379 | **4.1×** |
-| 10 | h 0.0095 / m 0.0085 | h 0.0236 / m 0.0288 | **0.0261** | 0.1700 | **6.5×** |
+| N | comp | 8 bit (h / m) | 2 bit (h / m) | 1 bit hybrid | 1 bit matched | 1-bit gap |
+|--:|--:|--:|--:|--:|--:|--:|
+| 4 | 64× | 0.0120 / 0.0108 | 0.0426 / 0.0193 | 0.0626 | 0.1022 | 1.6× |
+| 6 | 42× | 0.0100 / 0.0095 | 0.0369 / 0.0225 | 0.0500 | 0.1228 | 2.5× |
+| 8 | 32× | 0.0094 / 0.0090 | 0.0266 / 0.0242 | 0.0336 | 0.1379 | 4.1× |
+| 10 | 25× | 0.0095 / 0.0085 | 0.0236 / 0.0288 | **0.0261** | **0.1700** | **6.5×** |
 
-At ≥3 bits the classical decoder is **better or tied**. At **1 bit** the classical decoder
-*collapses* while the hybrid degrades gracefully, and the gap **grows with N**. So the defensible
-claim is narrow but real: *the quantum decoder is a fail-safe at extreme (1-bit) compression*, not
-a general efficiency win.
+At ≥3 bits the classical decoder is **better or tied** at every N. At **1 bit** it *collapses*
+while the hybrid degrades gracefully, and — the key trend — the **gap grows monotonically with N**
+(1.6× → 6.5×): *the more qubits, the larger the quantum decoder's advantage at extreme
+compression.* So the defensible claim is narrow but real: the quantum decoder is a **fail-safe at
+1-bit compression**, scaling with N — not a general efficiency win.
 
 **Honest caveats (must address before claiming a quantum advantage):**
 
